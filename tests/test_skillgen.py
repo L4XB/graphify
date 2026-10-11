@@ -300,18 +300,18 @@ def test_windows_frontmatter_name_and_shell_and_extra():
     assert core.index("## Troubleshooting") < core.index("## Honesty Rules")
 
 
-def test_codex_dispatch_is_agenttask_and_collects_in_memory():
-    """codex: spawn/wait/close_agent dispatch needing multi_agent = true."""
+def test_codex_dispatch_is_agenttask_and_persists_chunk_results():
+    """codex uses native agent dispatch and writes results for shared B3."""
     core, _ = _platform_artifacts("codex")
     assert "spawn_agent" in core
     assert "wait_agent" in core
     assert "close_agent" in core
     assert "multi_agent = true" in core
-    assert "Codex collects in memory" in core
     # The B2 dispatch slot itself (Codex heading -> Step B3) must not carry the
     # claude Agent-tool example. The shared Step B3 prose mentions the agent type
     # in a re-run hint, so scope the check to the dispatch block only.
     b2 = core[core.index("**Step B2"):core.index("**Step B3")]
+    assert "graphify-out/.graphify_chunk_NN.json" in b2
     assert "Concrete example for 3 chunks" not in b2
     assert "Agent tool call 1" not in b2
 
@@ -750,16 +750,18 @@ def test_always_on_roundtrip_is_byte_faithful():
         "When the user types `/graphify`, use the installed graphify skill or instructions "
         "before doing anything else."
     )
-    # The registry holds exactly the #1530 substitution plus the query-first rule.
+    # The registry holds the #1530 substitution plus the query-first and graph-diff rules.
     assert gen.ALWAYS_ON_SANCTIONED_EDITS["_AGENTS_MD_SECTION"] == (
         (old_instruction, new_instruction),
         gen._QUERY_FIRST_EDIT,
+        gen._GRAPH_DIFF_EDIT,
     )
     baseline_agents = gen._always_on_constants(gen.ALWAYS_ON_BASELINE_REF)["_AGENTS_MD_SECTION"]
-    # The ONLY divergences from the frozen baseline are the sanctioned sentences —
+    # The ONLY divergences from the frozen baseline are the sanctioned edits —
     # any other byte drift would have surfaced as a problem above.
     assert old_instruction in baseline_agents
-    old_rule, new_rule = gen._QUERY_FIRST_EDIT
+    baseline_agents = baseline_agents.replace(*gen._QUERY_FIRST_EDIT)
+    old_rule, new_rule = gen._GRAPH_DIFF_EDIT
     assert baseline_agents.replace(old_instruction, new_instruction).replace(old_rule, new_rule) == rendered_agents
     assert "`skill` tool" not in rendered_agents
     assert 'skill: "graphify"' not in rendered_agents
