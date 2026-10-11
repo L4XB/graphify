@@ -672,6 +672,89 @@ def test_rust_forward_reference_to_ambiguous_type_name_stays_local(tmp_path):
         assert (after, local) in refs
 
 
+def test_rust_cross_file_reference_skips_impl_blocks_in_other_files(tmp_path):
+    """#4283: an `impl Thing` block in another file adds a second `Thing` node,
+    but only the struct is a declaration. A cross-file reference must bind to
+    that declaration instead of being left on a sourceless stub. Checked cold,
+    then from the warm cache."""
+    (tmp_path / "a.rs").write_text("pub struct Thing {\n    pub n: u32,\n}\n", encoding="utf-8")
+    (tmp_path / "b.rs").write_text(
+        "use crate::a::Thing;\n\nimpl Thing {\n    pub fn new() -> Self {\n"
+        "        Thing { n: 0 }\n    }\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "c.rs").write_text(
+        "use crate::a::Thing;\n\npub fn make(t: Thing) -> u32 {\n    t.n\n}\n",
+        encoding="utf-8",
+    )
+    files = sorted(tmp_path.glob("*.rs"))
+    for _ in range(2):
+        r = extract(files, cache_root=tmp_path, parallel=False)
+        things = [n for n in r["nodes"] if n["label"] == "Thing"]
+        assert all(n["source_file"] for n in things), "sourceless Thing stub left behind"
+        declared = next(n["id"] for n in things if Path(n["source_file"]).name == "a.rs")
+        make = next(n["id"] for n in r["nodes"] if n["label"] == "make()")
+        refs = {(e["source"], e["target"]) for e in r["edges"] if e["relation"] == "references"}
+        assert (make, declared) in refs
+
+
+def test_rust_cross_file_reference_to_twice_declared_type_keeps_its_stub(tmp_path):
+    """#4283: impl blocks are only skipped in favour of a SINGLE declaration. With
+    two real `struct Thing` declarations a cross-file reference has no one
+    correct target, so it must stay on its sourceless stub (fail closed)."""
+    (tmp_path / "a.rs").write_text("pub struct Thing;\n", encoding="utf-8")
+    (tmp_path / "b.rs").write_text(
+        "pub struct Thing;\n\nimpl Thing {\n    pub fn new() -> Self {\n        Thing\n    }\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "c.rs").write_text("pub fn make(t: Thing) {}\n", encoding="utf-8")
+    r = extract(sorted(tmp_path.glob("*.rs")), cache_root=tmp_path, parallel=False)
+    by_id = {n["id"]: n for n in r["nodes"]}
+    make = next(n["id"] for n in r["nodes"] if n["label"] == "make()")
+    targets = [
+        by_id[e["target"]] for e in r["edges"]
+        if e["relation"] == "references" and e["source"] == make
+    ]
+    assert [t["source_file"] for t in targets if t["label"] == "Thing"] == [""]
+
+
+def _thing_targets_of_make(tmp_path, files):
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    r = extract(sorted(tmp_path.iterdir()), cache_root=tmp_path, parallel=False)
+    by_id = {n["id"]: n for n in r["nodes"]}
+    make = next(n["id"] for n in r["nodes"] if n["label"] == "make()")
+    return [
+        by_id[e["target"]]["source_file"] for e in r["edges"]
+        if e["relation"] == "references" and e["source"] == make
+        and by_id[e["target"]]["label"] == "Thing"
+    ]
+
+
+def test_rust_declaration_tiebreak_keeps_stub_beside_another_language(tmp_path):
+    """#4283: `_rust_declaration_count` only tells a Rust declaration from a Rust
+    impl block. A same-named TypeScript class is a declaration too, so a Rust
+    declaration plus a TS class is still ambiguous and the stub stays."""
+    targets = _thing_targets_of_make(tmp_path, {
+        "a.rs": "pub struct Thing;\n",
+        "b.ts": "export class Thing {}\n",
+        "c.rs": "pub fn make(t: Thing) {}\n",
+    })
+    assert targets == [""]
+
+
+def test_rust_declaration_tiebreak_keeps_stub_for_declarations_folded_in_one_node(tmp_path):
+    """#4283: two inline modules declaring `Thing` in one file fold into a single
+    node with `_rust_declaration_count == 2`. That is two declarations, so an
+    impl block elsewhere must not let the reference bind to the folded node."""
+    targets = _thing_targets_of_make(tmp_path, {
+        "a.rs": "mod x {\n    pub struct Thing;\n}\nmod y {\n    pub struct Thing;\n}\n",
+        "b.rs": "impl Thing {\n    pub fn new() {}\n}\n",
+        "c.rs": "pub fn make(t: Thing) {}\n",
+    })
+    assert targets == [""]
+
+
 # ── extract() dispatch ────────────────────────────────────────────────────────
 
 def test_extract_dispatches_all_languages():
@@ -857,6 +940,57 @@ def test_sql_clean_trigger_links_to_its_on_table(tmp_path):
     assert "audit_ins" in by_label
     edges = {(e["source"], e["relation"], e["target"]) for e in r["edges"]}
     assert (by_label["audit_ins"]["id"], "triggers", by_label["users"]["id"]) in edges
+
+
+def test_sql_trigger_links_to_the_function_it_executes(tmp_path):
+    """A trigger exists to run a function, yet the EXECUTE FUNCTION/PROCEDURE
+    target was never linked. Only the ON table got an edge, so the trigger's
+    whole reason to exist — the routine it fires — was dropped from the graph.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    p = tmp_path / "schema.sql"
+    p.write_text(
+        "CREATE TABLE users (id INT);\n"
+        "CREATE FUNCTION log_it() RETURNS TRIGGER AS 'SELECT 1';\n"
+        "CREATE TRIGGER audit_ins AFTER INSERT ON users\n"
+        "  FOR EACH ROW EXECUTE FUNCTION log_it();\n",
+        encoding="utf-8",
+    )
+    r = extract_sql(p)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert "audit_ins" in by_label and "log_it()" in by_label
+    edges = {(e["source"], e["relation"], e["target"]) for e in r["edges"]}
+    # The trigger fires on its ON table ...
+    assert (by_label["audit_ins"]["id"], "triggers", by_label["users"]["id"]) in edges
+    # ... and executes the function it names.
+    assert (by_label["audit_ins"]["id"], "executes", by_label["log_it()"]["id"]) in edges
+    # Nothing dangles.
+    node_ids = {n["id"] for n in r["nodes"]}
+    assert all(e["source"] in node_ids and e["target"] in node_ids for e in r["edges"])
+
+
+def test_sql_trigger_executing_an_undefined_function_fails_closed(tmp_path):
+    """When the executed routine is not defined in this file, link nothing
+    rather than mint a bare-name stub that could never rewire onto the real
+    `name()` function node. The ON-table edge is unaffected.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    p = tmp_path / "schema.sql"
+    p.write_text(
+        "CREATE TABLE users (id INT);\n"
+        "CREATE TRIGGER audit_ins AFTER INSERT ON users EXECUTE FUNCTION elsewhere();\n",
+        encoding="utf-8",
+    )
+    r = extract_sql(p)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    assert (by_label["audit_ins"]["id"], "triggers", by_label["users"]["id"]) in {
+        (e["source"], e["relation"], e["target"]) for e in r["edges"]
+    }
+    # No executes edge, and the unresolved routine was not minted as a node.
+    assert not any(e["relation"] == "executes" for e in r["edges"])
+    assert "elsewhere()" not in by_label
+    node_ids = {n["id"] for n in r["nodes"]}
+    assert all(e["source"] in node_ids and e["target"] in node_ids for e in r["edges"])
 
 
 def test_sql_procedural_body_trigger_is_recovered(tmp_path):

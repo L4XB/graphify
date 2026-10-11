@@ -22,7 +22,7 @@ from graphify.google_workspace import (
     convert_google_workspace_file,
     google_workspace_enabled,
 )
-from graphify.paths import GRAPHIFY_OUT, out_path
+from graphify.paths import GRAPHIFY_OUT, GRAPHIFY_OUT_NAME, out_path
 
 
 class FileType(str, Enum):
@@ -1614,18 +1614,15 @@ def _is_ignored(
     if not patterns:
         return False
 
-    root_nparts = len(root.parts)
-
     def _eval(target: Path) -> bool:
         """Apply last-match-wins to a single target path.
 
         Everything derivable from ``target`` alone — its parts, its relative
-        path per anchor, the root-relative path, the split segments and their
-        "/"-joined prefixes, the NFC name, the is_dir() stat — is computed at
-        most ONCE per call, no matter how many patterns are evaluated. The
-        previous shape rebuilt pathlib objects (``relative_to``) and re-split
-        strings per PATTERN per entry, which pinned real scans for tens of
-        minutes (see CHANGELOG).
+        path per anchor, the NFC name, the is_dir() stat — is computed at most
+        ONCE per call, no matter how many patterns are evaluated. The previous
+        shape rebuilt pathlib objects (``relative_to``) and re-split strings
+        per PATTERN per entry, which pinned real scans for tens of minutes
+        (see CHANGELOG).
         """
         if _cache is not None and target in _cache:
             return _cache[target]
@@ -1633,44 +1630,22 @@ def _is_ignored(
         target_parts = target.parts
         target_name_nfc: str | None = None
         target_is_dir: bool | None = None
-        rel_root_known = False
-        rel_root: str | None = None
-        # rel string (or None = outside anchor) and part-count per distinct
-        # anchor; patterns overwhelmingly share a handful of anchors.
-        rel_by_anchor: dict[Path, tuple[str | None, int]] = {}
-        # split segments + accumulated "/" prefixes per distinct rel string.
-        segs_by_rel: dict[str, tuple[list[str], list[str]]] = {}
-
-        def _segments(rel: str) -> tuple[list[str], list[str]]:
-            got = segs_by_rel.get(rel)
-            if got is None:
-                parts = rel.split("/")
-                prefixes: list[str] = []
-                acc = ""
-                for part in parts:
-                    acc = part if not acc else acc + "/" + part
-                    prefixes.append(acc)
-                got = (parts, prefixes)
-                segs_by_rel[rel] = got
-            return got
+        # rel string (or None = outside anchor) per distinct anchor; patterns
+        # overwhelmingly share a handful of anchors.
+        rel_by_anchor: dict[Path, str | None] = {}
 
         def _matches(rel: str, p: str, path_relative: bool) -> bool:
             nonlocal target_name_nfc
             if path_relative:
                 return _match_anchored_ignore_pattern(rel, p)
-            if fnmatch.fnmatch(rel, p):
-                return True
+            # A pattern without a slash names one path component, so it is
+            # compared with the target's own name only. Ancestors are tested
+            # one by one by _is_ignored's parent-exclusion walk; matching them
+            # again here let `*` cross "/" and left a directory re-included
+            # with `!dir/` without its files.
             if target_name_nfc is None:
                 target_name_nfc = _nfc(target.name)
-            if fnmatch.fnmatch(target_name_nfc, p):
-                return True
-            parts, prefixes = _segments(rel)
-            for part, prefix in zip(parts, prefixes):
-                if fnmatch.fnmatch(part, p):
-                    return True
-                if fnmatch.fnmatch(prefix, p):
-                    return True
-            return False
+            return fnmatch.fnmatch(target_name_nfc, p)
 
         result = False
         for anchor, pattern in patterns:
@@ -1683,26 +1658,14 @@ def _is_ignored(
             # let e.g. .hypothesis/.gitignore's bare "*" ignore the ENTIRE repo
             # (detect() returned 0 files). The anchor dir itself is exempt — an
             # ignore file governs its directory's contents, not the directory.
-            cached_rel = rel_by_anchor.get(anchor)
-            if cached_rel is None:
-                cached_rel = (
-                    _lexical_relative(target, target_parts, anchor),
-                    len(anchor.parts),
-                )
-                rel_by_anchor[anchor] = cached_rel
-            rel_anchor, anchor_nparts = cached_rel
+            if anchor not in rel_by_anchor:
+                rel_by_anchor[anchor] = _lexical_relative(target, target_parts, anchor)
+            rel_anchor = rel_by_anchor[anchor]
             if rel_anchor is None:
                 continue  # target outside this pattern's anchor: cannot match
             matched = False
             if rel_anchor != ".":
-                rel = rel_anchor
-                if not path_relative and root_nparts > anchor_nparts:
-                    if not rel_root_known:
-                        rel_root_known = True
-                        rel_root = _lexical_relative(target, target_parts, root)
-                    if rel_root is not None:
-                        rel = rel_root
-                matched = _matches(rel, p, path_relative=path_relative)
+                matched = _matches(rel_anchor, p, path_relative=path_relative)
                 if matched and directory_only:
                     if target_is_dir is None:
                         target_is_dir = target.is_dir()
@@ -2397,6 +2360,27 @@ def _collapse_manifest_duplicates(
     return result
 
 
+def _manifest_storage_anchor(manifest_path: str | Path | None, root: Path | None) -> Path | None:
+    """When a manifest lives under <repo>/graphify-out/manifest.json and root
+    is a subfolder of <repo>, stored relative keys are anchored to <repo> (#3785)."""
+    if root is None or not manifest_path:
+        return root
+    try:
+        mp = Path(manifest_path).resolve()
+        if mp.parent.name in ("graphify-out", GRAPHIFY_OUT_NAME):
+            manifest_base = mp.parent.parent
+            root_resolved = Path(root).resolve()
+            if root_resolved != manifest_base:
+                try:
+                    root_resolved.relative_to(manifest_base)
+                    return manifest_base
+                except ValueError:
+                    pass
+    except (OSError, RuntimeError):
+        pass
+    return root
+
+
 def load_manifest(
     manifest_path: str = _MANIFEST_PATH,
     *,
@@ -2421,9 +2405,67 @@ def load_manifest(
         return raw
     if root is None:
         return _collapse_manifest_duplicates(raw.items(), _nfc)
+    anchor = _manifest_storage_anchor(manifest_path, root) or root
     return _collapse_manifest_duplicates(
-        raw.items(), lambda k: _nfc(_to_absolute_from_storage(k, root))
+        raw.items(), lambda k: _nfc(_to_absolute_from_storage(k, anchor))
     )
+
+
+def _checkout_prefix(abs_key: str, relative_keys: set[str]) -> str | None:
+    """Longest directory prefix of ``abs_key`` whose suffix is in ``relative_keys``.
+
+    The suffix is forward-slash and NFC. ``src/c.py`` beats a shorter ``c.py``.
+    Prefixes ``""``, ``"/"``, and ``"\\"`` are skipped so a shorter suffix can
+    still match. The prefix that remains must be a real directory.
+    """
+    parts = _nfc(abs_key).replace("\\", "/").split("/")
+    best: tuple[int, str] | None = None
+    for i in range(1, len(parts)):
+        suffix = "/".join(parts[i:])
+        if suffix not in relative_keys:
+            continue
+        prefix = "/".join(parts[:i])
+        if prefix in ("", "/", "\\"):
+            continue
+        if not Path(prefix).is_dir():
+            continue
+        if best is None or len(suffix) > best[0]:
+            best = (len(suffix), prefix)
+    return None if best is None else best[1]
+
+
+def _previous_checkout_absolute_keys(
+    existing_keys: Iterable[Any],
+    storage_root: Path | None,
+    relative_keys: set[str],
+) -> set[str]:
+    """Absolute keys that still name a previous checkout (#3581).
+
+    A key is a candidate only when :func:`_to_relative_for_storage` keeps it
+    absolute against ``storage_root`` (a sibling row that becomes relative,
+    including #3785, is not a candidate). Candidates that share one directory
+    prefix are a previous checkout when that group has at least two keys. One
+    absolute key is an include row and stays. ``storage_root is None`` yields
+    an empty set.
+    """
+    if storage_root is None:
+        return set()
+    groups: dict[str, set[str]] = {}
+    for key in existing_keys:
+        if not isinstance(key, str) or not _looks_absolute(key):
+            continue
+        stored = _nfc(_to_relative_for_storage(key, storage_root))
+        if not _looks_absolute(stored):
+            continue
+        prefix = _checkout_prefix(stored, relative_keys)
+        if prefix is None:
+            continue
+        groups.setdefault(prefix, set()).add(key)
+    stale: set[str] = set()
+    for keys in groups.values():
+        if len(keys) >= 2:
+            stale.update(keys)
+    return stale
 
 
 def save_manifest(
@@ -2458,9 +2500,12 @@ def save_manifest(
     forever and masquerading as deletions in detect_incremental. It must be
     the RAW detect output, not a stamp-filtered subset — pruning to a
     filtered set would erase rows the filter merely omitted (failed chunks,
-    --code-only doc rows). Out-of-root entries are never pruned. Callers
-    saving a SUBSET of files (changed_paths hooks, skill runbooks, #917)
-    must leave this None so their untouched rows are preserved.
+    --code-only doc rows). When this argument is set, two or more absolute
+    keys that share a directory prefix and match relative keys this save writes
+    are a previous checkout and are dropped (#3581). A single include row stays.
+    Callers saving a SUBSET of files (changed_paths hooks, skill runbooks, #917)
+    must leave this None so their untouched rows, including out-of-root rows,
+    are preserved.
 
     ``clear_semantic`` (#1948): files that were dispatched this run but
     produced no stamped output (e.g. the LLM omitted their chunk on a
@@ -2561,6 +2606,21 @@ def save_manifest(
     # caller supplied the full scan corpus, additionally prune in-root rows
     # the scan no longer covers: those files were excluded, not deleted, and
     # keeping the row makes them look deleted on every future run (#1908).
+    all_files = [f for file_list in files.values() for f in file_list]
+    storage_root = _manifest_storage_anchor(manifest_path, root) if root is not None else None
+    # A subset save omits scan_corpus and must keep every live row it was not
+    # given (#917), including an include row and a previous checkout. The
+    # checkout drop runs only on a full scan.
+    stale_checkout: set[str] = set()
+    if scan_set is not None and storage_root is not None:
+        new_rels: set[str] = set()
+        for f in all_files:
+            stored = _nfc(_to_relative_for_storage(_nfc(f), storage_root))
+            if not _looks_absolute(stored):
+                new_rels.add(stored)
+        stale_checkout = _previous_checkout_absolute_keys(
+            existing.keys(), storage_root, new_rels
+        )
     manifest: dict[str, dict] = {}
     for f, entry in existing.items():
         normalised = _normalise_entry(entry)
@@ -2571,6 +2631,8 @@ def save_manifest(
                 continue
         except OSError:
             continue
+        if f in stale_checkout:
+            continue  # previous checkout copied with graphify-out (#3581)
         if scan_set is not None and not _in_scan(f) and _in_root(f):
             continue  # excluded-but-alive: drop the stale row (#1908)
         if clear_ast_set is not None and _in_clear_ast(f):
@@ -2583,7 +2645,6 @@ def save_manifest(
             normalised = {**normalised, "semantic_hash": ""}
         manifest[f] = normalised
 
-    all_files = [f for file_list in files.values() for f in file_list]
     with ThreadPoolExecutor() as pool:
         raw = pool.map(_stat_and_hash, all_files)
     hashed: dict[str, tuple[float, str]] = {
@@ -2624,18 +2685,9 @@ def save_manifest(
             "semantic_hash": sem_h,
         }
         manifest[key] = entry
-    if root is not None:
-        # Persist in portable form: forward-slash relative paths. Keys outside
-        # ``root`` (out-of-tree symlinked corpora, --include sources) keep
-        # their absolute form so the manifest round-trips on the saving
-        # machine even when not every entry can be portably encoded.
-        # NFC after relativize so on-disk keys match what load_manifest
-        # re-anchors and compares against (#2221). A seeded absolute key and
-        # a seeded relative key for the same file collapse here too (#1964)
-        # -- _collapse_manifest_duplicates keeps whichever is more recently
-        # seen instead of whichever the dict comprehension iterates last.
+    if storage_root is not None:
         manifest = _collapse_manifest_duplicates(
-            manifest.items(), lambda k: _nfc(_to_relative_for_storage(k, root))
+            manifest.items(), lambda k: _nfc(_to_relative_for_storage(k, storage_root))
         )
     else:
         manifest = _collapse_manifest_duplicates(manifest.items(), _nfc)
@@ -2813,10 +2865,32 @@ def detect_incremental(
     # current scan was EXCLUDED (ignore rules / --exclude changed) and must
     # not be reported as deleted. Mirrors the watch-side excluded-vs-deleted
     # distinction (#1795).
+    try:
+        root_res: Path | None = Path(root).resolve() if root is not None else None
+    except (OSError, RuntimeError):
+        root_res = Path(root) if root is not None else None
+
+    def _in_root(path_str: str) -> bool:
+        if root_res is None:
+            return True
+        p = Path(path_str)
+        try:
+            p.relative_to(root_res)
+            return True
+        except ValueError:
+            pass
+        try:
+            p.resolve().relative_to(root_res)
+            return True
+        except (ValueError, OSError, RuntimeError):
+            return False
+
     current_files = {_nfc(f) for flist in full["files"].values() for f in flist}
     deleted_files: list[str] = []
     excluded_files: list[str] = []
     for f in manifest:
+        if not _in_root(f):
+            continue
         if _nfc(f) in current_files:
             continue
         try:
